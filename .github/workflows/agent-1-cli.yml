@@ -1,0 +1,96 @@
+# Builds the linux-x64 CLI archive of this branch for agent-1 (Tuhis/ioio,
+# vm-images/agent-nixos) and attaches it to a GitHub Release. The branch is an
+# upstream nightly plus pingdotgg/t3code#25339 (Claude sessions in the
+# interactive CLI), until that lands upstream.
+#
+# Mirrors release-desktop.yml's CLI-archive steps for one target, on a
+# GitHub-hosted runner instead of Blacksmith. The relay and Clerk values are
+# the public ones the official builds embed, so T3 Connect keeps working.
+#
+# Run it from the Actions tab with the upstream version this branch is based
+# on; the release is tagged agent-1-v<version>-icli.<n>.
+name: agent-1 CLI archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream version this branch is based on (e.g. 0.1.3-nightly.20261026.3717)
+        required: true
+      build:
+        description: Build number for this version (bump on a rebuild)
+        required: true
+        default: "1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: agent-1-v${{ inputs.version }}-icli.${{ inputs.build }}
+      T3CODE_TELEMETRY_CHANNEL: dev
+      T3CODE_RELAY_URL: https://relay.t3.codes
+      T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: hzxSgY2cH10sDU2r
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts...
+
+      - name: Typecheck and test the Claude adapter
+        run: |
+          vp run --filter t3 --filter @t3tools/contracts typecheck
+          pnpm --filter t3 exec vp test run \
+            src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts \
+            src/orchestration-v2/Adapters/ClaudeTerminalMessages.test.ts \
+            src/orchestration-v2/Adapters/ClaudeTerminalApiTap.test.ts
+
+      - run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - run: vp run --filter t3 build
+
+      - name: Apply web client branding
+        run: |
+          brand=production
+          if [[ "$VERSION" =~ -nightly\.[0-9]{8}\.[0-9]+$ ]]; then brand=nightly; fi
+          node scripts/apply-web-brand-assets.ts "$brand" apps/server/dist/client
+
+      - name: Build resource monitor
+        run: |
+          cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
+          mkdir -p "$RUNNER_TEMP/cli-resource-monitor/linux-x64"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$RUNNER_TEMP/cli-resource-monitor/linux-x64/"
+
+      - run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - run: |
+          node scripts/build-cli-archive.ts --platform linux --arch x64 --version "$VERSION" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" --output-dir release-cli
+
+      - run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$VERSION"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release-cli
+          sha256sum -- * > SHA256SUMS
+          gh release create "$TAG" --target "$GITHUB_SHA" --prerelease \
+            --title "$TAG" \
+            --notes "Upstream $VERSION plus pingdotgg/t3code#25339, built for agent-1 from $GITHUB_SHA." \
+            -- *
